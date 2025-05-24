@@ -39,6 +39,7 @@ def solver(u0_batch, t_coordinate, nu, rho):
             solutions[:, 0, :] contains the initial conditions (u0_batch),
             solutions[:, i, :] contains the solutions at time t_coordinate[i].
     """
+    
     # Extract the dimensions
     batch_size, N = u0_batch.shape
     T = len(t_coordinate) - 1

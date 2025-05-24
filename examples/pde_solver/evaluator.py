@@ -1,5 +1,6 @@
 """
-Evaluator for 1D Reaction-Diffusion PDE Solver with cascade evaluation
+Evaluator for 1D Reaction-Diffusion PDE Solver with timeout handling
+and automatic GPU allocation. (Modified as per request)
 """
 
 import importlib.util
@@ -13,104 +14,96 @@ import traceback
 import sys
 import pickle
 import h5py
+import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 
-
+# Define TimeoutError for handling long executions
 class TimeoutError(Exception):
     pass
-
 
 def timeout_handler(signum, frame):
     """Handle timeout signal"""
     raise TimeoutError("Function execution timed out")
 
+# --- GPU Allocation ---
 
-def compute_nrmse(u_computed, u_reference):
-    """Computes the Normalized Root Mean Squared Error (nRMSE) between the computed solution and reference.
-    
-    Args:
-        u_computed (np.ndarray): Computed solution [batch_size, len(t_coordinate), N].
-        u_reference (np.ndarray): Reference solution [batch_size, len(t_coordinate), N].
-        
-    Returns:
-        nrmse (np.float32): The normalized RMSE value.
+def get_free_gpu():
     """
+    Finds the ID of the GPU with the most free memory and lowest utilization.
+    Returns its ID as a string, or None if nvidia-smi fails or no GPU is found.
+    """
+    try:
+        command = ['nvidia-smi', '--query-gpu=index,memory.free,utilization.gpu', '--format=csv,noheader,nounits']
+        output = subprocess.check_output(command, encoding='utf-8').strip()
+        gpus = []
+        for line in output.split('\n'):
+            if line:
+                try:
+                    index, free_mem, util = line.split(', ')
+                    gpus.append({
+                        'id': int(index),
+                        'free_mem': float(free_mem),
+                        'util': float(util)
+                    })
+                except ValueError:
+                    print(f"Warning: Could not parse nvidia-smi line: '{line}'")
+                    continue
+
+        if not gpus:
+            print("Warning: No GPUs found by nvidia-smi.")
+            return None
+
+        best_gpu = min(gpus, key=lambda gpu: (gpu['util'], -gpu['free_mem']))
+        print(f"Found GPUs: {gpus}")
+        print(f"Selected GPU {best_gpu['id']} (Util: {best_gpu['util']}%, Free: {best_gpu['free_mem']}MiB)")
+        return str(best_gpu['id'])
+
+    except FileNotFoundError:
+        print("Warning: nvidia-smi command not found. Cannot automatically assign GPU.")
+        return None
+    except Exception as e:
+        print(f"Warning: Error while querying GPUs: {e}")
+        return None
+
+# --- Helper functions (to be used inside the subprocess) ---
+_SUBPROCESS_HELPERS = """
+import numpy as np
+import h5py
+import time
+
+def compute_rmse(u_computed, u_reference):
+    \"\"\"Computes the Root Mean Squared Error (RMSE).\"\"\"
+    # Ensure inputs are numpy arrays
+    u_computed = np.asarray(u_computed)
+    u_reference = np.asarray(u_reference)
+
+    # Check for NaN or Inf values
+    if not np.all(np.isfinite(u_computed)):
+        print("Warning: NaN or Inf found in computed solution. Returning inf RMSE.")
+        return np.inf
+    if not np.all(np.isfinite(u_reference)):
+        print("Warning: NaN or Inf found in reference solution.")
+        return np.inf
+
+    # Calculate RMSE per batch item
     rmse_values = np.sqrt(np.mean((u_computed - u_reference)**2, axis=(1,2)))
-    u_true_norm = np.sqrt(np.mean(u_reference**2, axis=(1,2)))
-    nrmse = np.mean(rmse_values / u_true_norm)
-    return nrmse
 
+    # Average RMSE across the batch
+    rmse = np.mean(rmse_values)
+    return rmse
 
-def init(xc, modes=["sin"], u0=1.0, du=0.1):
-    """Initializes one or more 1D scalar functions based on specified modes."""
-    initial_conditions = []
-    for mode in modes:
-        assert mode in ["sin", "sinsin", "Gaussian", "react", "possin"], f"mode {mode} not supported!"
-        
-        if mode == "sin":
-            u = u0 * np.sin((xc + 1.0) * np.pi)
-        elif mode == "sinsin":
-            u = np.sin((xc + 1.0) * np.pi) + du * np.sin((xc + 1.0) * np.pi * 8.0)
-        elif mode == "Gaussian":
-            t0 = 1.0
-            u = np.exp(-(xc**2) * np.pi / (4.0 * t0)) / np.sqrt(2.0 * t0)
-        elif mode == "react":
-            logu = -0.5 * (xc - np.pi) ** 2 / (0.25 * np.pi) ** 2
-            u = np.exp(logu)
-        elif mode == "possin":
-            u = u0 * np.abs(np.sin((xc + 1.0) * np.pi))
-            
-        initial_conditions.append(u)
-    return np.stack(initial_conditions)
+def load_data(path, is_h5py=True):
+    \"\"\"Loads data from an HDF5 file.\"\"\"
+    if is_h5py:
+        with h5py.File(path, 'r') as f:
+            t_coordinate = np.array(f['t-coordinate'])
+            u = np.array(f['tensor'])
+            x_coordinate = np.array(f['x-coordinate'])
+    else:
+        raise NotImplementedError("Only h5py format is supported for now.")
 
-
-def interpolate_solution(u_fine, x_fine, t_fine, x_coarse, t_coarse):
-    """Interpolates the fine solution onto the coarse grid in both space and time."""
-    # Interpolate in space
-    space_interp_func = interp1d(x_fine, u_fine, axis=2, kind='linear', fill_value="extrapolate")
-    u_fine_interp_space = space_interp_func(x_coarse)
-    
-    # Interpolate in time
-    time_interp_func = interp1d(t_fine, u_fine_interp_space, axis=1, kind='linear', fill_value="extrapolate")
-    u_fine_interp = time_interp_func(t_coarse)
-    
-    return u_fine_interp
-
-
-def compute_error(coarse_tuple, fine_tuple):
-    """Computes the error between coarse and fine grid solutions."""
-    u_coarse, x_coarse, t_coarse = coarse_tuple
-    u_fine, x_fine, t_fine = fine_tuple
-    u_fine_interp = interpolate_solution(u_fine, x_fine, t_fine, x_coarse, t_coarse)
-    
-    # Compute L2 norm error
-    error = np.mean(np.linalg.norm(u_coarse - u_fine_interp, axis=(1,2))) / np.sqrt(u_coarse.size)
-    return error
-
-
-def get_x_coordinate(x_min, x_max, nx):
-    dx = (x_max - x_min) / nx
-    xe = np.linspace(x_min, x_max, nx+1)
-    xc = xe[:-1] + 0.5 * dx
-    return xc
-
-
-def get_t_coordinate(t_min, t_max, dt):
-    it_tot = int(np.ceil((t_max - t_min) / dt) + 1)
-    tc = np.arange(it_tot + 1) * dt
-    return tc
-
-
-def load_data(path):
-    """Load data from HDF5 file."""
-    with h5py.File(path, 'r') as f:
-        t_coordinate = np.array(f['t-coordinate'])
-        u = np.array(f['tensor'])
-        x_coordinate = np.array(f['x-coordinate'])
-    
     t_min, t_max = t_coordinate[0], t_coordinate[-1]
     x_min, x_max = x_coordinate[0], x_coordinate[-1]
-    
     return dict(
         tensor=u,
         t_coordinate=t_coordinate,
@@ -120,60 +113,15 @@ def load_data(path):
         x_min=x_min,
         x_max=x_max
     )
+"""
 
-
-def convergence_test_subprocess(solver_module, nu, rho,
-                              nxs=[256, 512, 1024, 2048],
-                              dts=[0.01, 0.01, 0.01, 0.01],
-                              t_min=0, t_max=2,
-                              x_min=-1, x_max=1):
-    """Run convergence test on the solver."""
-    us = []
-    xcs = []
-    tcs = []
-    
-    for nx, dt in zip(nxs, dts):
-        tc = get_t_coordinate(t_min, t_max, dt)
-        xc = get_x_coordinate(x_min, x_max, nx)
-        u0 = init(xc)
-        u = solver_module.solver(u0, tc, nu, rho)
-        us.append(np.squeeze(np.array(u)))
-        xcs.append(np.array(xc))
-        tcs.append(np.array(tc))
-    
-    # Compute errors
-    errors = []
-    for i in range(len(nxs) - 1):
-        coarse_tuple = (us[i], xcs[i], tcs[i])
-        fine_tuple = (us[-1], xcs[-1], tcs[-1])
-        error = compute_error(coarse_tuple, fine_tuple)
-        errors.append(error)
-    
-    # Calculate average convergence rate
-    rates = []
-    for i in range(len(nxs) - 2):
-        rate = np.log(errors[i] / errors[i+1]) / np.log(nxs[i+1] / nxs[i])
-        rates.append(rate)
-    
-    avg_rate = np.mean(rates) if rates else 0.0
-    return avg_rate
-
+# --- Subprocess Execution ---
 
 def run_with_timeout(program_path, dataset_path, nu, rho, timeout_seconds=600):
     """
-    Run the solver in a separate process with timeout.
-    
-    Args:
-        program_path: Path to the solver file
-        dataset_path: Path to the dataset file
-        nu: Diffusion coefficient
-        rho: Reaction coefficient
-        timeout_seconds: Maximum execution time
-        
-    Returns:
-        Dictionary with results
+    Run the PDE evaluation in a separate process with timeout and GPU selection.
     """
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as temp_file:
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode='w', encoding='utf-8') as temp_file:
         script = f"""
 import sys
 import numpy as np
@@ -181,459 +129,280 @@ import os
 import pickle
 import traceback
 import h5py
-from scipy.interpolate import interp1d
+import time
+import importlib.util
 
-# Add the directory to sys.path
-sys.path.insert(0, os.path.dirname('{program_path}'))
+# Add helper functions
+{_SUBPROCESS_HELPERS}
 
-print(f"Running solver evaluation...")
-print(f"Program path: {program_path}")
-print(f"Dataset path: {dataset_path}")
-print(f"nu: {nu}, rho: {rho}")
-
-# Helper functions needed by the solver
-def get_x_coordinate(x_min, x_max, nx):
-    dx = (x_max - x_min) / nx
-    xe = np.linspace(x_min, x_max, nx+1)
-    xc = xe[:-1] + 0.5 * dx
-    return xc
-
-def get_t_coordinate(t_min, t_max, dt):
-    it_tot = int(np.ceil((t_max - t_min) / dt) + 1)
-    tc = np.arange(it_tot + 1) * dt
-    return tc
-
-def init(xc, modes=["sin"], u0=1.0, du=0.1):
-    initial_conditions = []
-    for mode in modes:
-        if mode == "sin":
-            u = u0 * np.sin((xc + 1.0) * np.pi)
-        elif mode == "sinsin":
-            u = np.sin((xc + 1.0) * np.pi) + du * np.sin((xc + 1.0) * np.pi * 8.0)
-        elif mode == "Gaussian":
-            t0 = 1.0
-            u = np.exp(-(xc**2) * np.pi / (4.0 * t0)) / np.sqrt(2.0 * t0)
-        elif mode == "react":
-            logu = -0.5 * (xc - np.pi) ** 2 / (0.25 * np.pi) ** 2
-            u = np.exp(logu)
-        elif mode == "possin":
-            u = u0 * np.abs(np.sin((xc + 1.0) * np.pi))
-        initial_conditions.append(u)
-    return np.stack(initial_conditions)
-
-def interpolate_solution(u_fine, x_fine, t_fine, x_coarse, t_coarse):
-    space_interp_func = interp1d(x_fine, u_fine, axis=2, kind='linear', fill_value="extrapolate")
-    u_fine_interp_space = space_interp_func(x_coarse)
-    time_interp_func = interp1d(t_fine, u_fine_interp_space, axis=1, kind='linear', fill_value="extrapolate")
-    u_fine_interp = time_interp_func(t_coarse)
-    return u_fine_interp
-
-def compute_error(coarse_tuple, fine_tuple):
-    u_coarse, x_coarse, t_coarse = coarse_tuple
-    u_fine, x_fine, t_fine = fine_tuple
-    u_fine_interp = interpolate_solution(u_fine, x_fine, t_fine, x_coarse, t_coarse)
-    error = np.mean(np.linalg.norm(u_coarse - u_fine_interp, axis=(1,2))) / np.sqrt(u_coarse.size)
-    return error
-
-try:
-    # Import the solver
-    spec = __import__('importlib.util').util.spec_from_file_location("solver_module", '{program_path}')
-    solver_module = __import__('importlib.util').util.module_from_spec(spec)
-    spec.loader.exec_module(solver_module)
-    
-    # Load dataset
-    with h5py.File('{dataset_path}', 'r') as f:
-        t_coordinate = np.array(f['t-coordinate'])
-        u = np.array(f['tensor'])
-        x_coordinate = np.array(f['x-coordinate'])
-    
-    print(f"Loaded data with shape: {{u.shape}}")
-    
-    # Extract test set
-    u0 = u[:, 0]
-    u_ref = u[:, :]
-    
-    # Run solver
-    start_time = __import__('time').time()
-    u_batch = solver_module.solver(u0, t_coordinate, {nu}, {rho})
-    end_time = __import__('time').time()
-    solver_time = end_time - start_time
-    
-    # Compute nRMSE
-    u_batch = np.array(u_batch)
-    rmse_values = np.sqrt(np.mean((u_batch - u_ref)**2, axis=(1,2)))
-    u_true_norm = np.sqrt(np.mean(u_ref**2, axis=(1,2)))
-    nrmse = np.mean(rmse_values / u_true_norm)
-    
-    # Run simplified convergence test
-    t_min, t_max = t_coordinate[0], t_coordinate[-1]
-    x_min, x_max = x_coordinate[0], x_coordinate[-1]
-    
-    # Simplified convergence test with fewer resolutions
-    nxs = [256, 512, 1024]
-    dts = [0.01, 0.01, 0.01]
-    us = []
-    xcs = []
-    tcs = []
-    
-    for nx, dt in zip(nxs, dts):
-        tc = get_t_coordinate(t_min, min(t_max/10, t_max), dt)  # Limit time for speed
-        xc = get_x_coordinate(x_min, x_max, nx)
-        u0_conv = init(xc)
-        u_conv = solver_module.solver(u0_conv, tc, {nu}, {rho})
-        us.append(np.squeeze(np.array(u_conv)))
-        xcs.append(np.array(xc))
-        tcs.append(np.array(tc))
-    
-    # Compute convergence rate
-    errors = []
-    for i in range(len(nxs) - 1):
-        coarse_tuple = (us[i], xcs[i], tcs[i])
-        fine_tuple = (us[-1], xcs[-1], tcs[-1])
-        error = compute_error(coarse_tuple, fine_tuple)
-        errors.append(error)
-    
-    if len(errors) >= 2:
-        avg_rate = np.log(errors[0] / errors[1]) / np.log(nxs[1] / nxs[0])
-    else:
-        avg_rate = 0.0
-    
-    # Save results
-    results = {{
-        'nrmse': float(nrmse),
-        'avg_rate': float(avg_rate),
-        'solver_time': float(solver_time),
-        'u_batch_shape': u_batch.shape,
-        'success': True
-    }}
-    
-    with open('{temp_file.name}.results', 'wb') as f:
-        pickle.dump(results, f)
-    
-    print(f"Results: nRMSE={{nrmse:.6f}}, avg_rate={{avg_rate:.3f}}, time={{solver_time:.2f}}s")
-    
-except Exception as e:
-    print(f"Error in subprocess: {{str(e)}}")
-    traceback.print_exc()
-    with open('{temp_file.name}.results', 'wb') as f:
-        pickle.dump({{'error': str(e), 'success': False}}, f)
-"""
-        temp_file.write(script.encode())
-        temp_file_path = temp_file.name
-    
-    results_path = f"{temp_file_path}.results"
-    
+# Main execution block
+def run_evaluation(program_path, dataset_path, nu, rho, results_path):
     try:
-        # Run the script with timeout
+        # Import the solver
+        print(f"Importing solver from: {{program_path}}")
+        spec = importlib.util.spec_from_file_location("program", program_path)
+        program = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(program)
+        solver = program.solver
+        print("Solver imported successfully.")
+
+        # Load data
+        print(f"Loading data from: {{dataset_path}}")
+        data_dict = load_data(dataset_path)
+        u = data_dict['tensor']
+        t_coordinate = data_dict['t_coordinate']
+        x_coordinate = data_dict['x_coordinate']
+        print(f"Loaded data with shape: {{u.shape}}")
+
+        # Extract test set
+        u0 = u[:, 0]
+        u_ref = u[:, :]
+        batch_size, N = u0.shape
+
+        # Run solver
+        print("Running the solver...")
+        start_time = time.time()
+        u_batch = solver(u0, t_coordinate, nu, rho)
+        end_time = time.time()
+        eval_time = end_time - start_time
+        print(f"Solver finished in {{eval_time:.2f}}s.")
+
+        # Compute RMSE
+        rmse = compute_rmse(u_batch, u_ref)
+        print(f"RMSE: {{rmse:.3e}}")
+
+        # No convergence test anymore
+
+        results = {{
+            'rmse': rmse,
+            'eval_time': eval_time,
+            'status': 'success'
+        }}
+
+    except Exception as e:
+        print(f"Error in subprocess: {{str(e)}}")
+        traceback.print_exc()
+        results = {{'error': str(e), 'status': 'error', 'traceback': traceback.format_exc(), 'rmse': float('inf')}}
+
+    # Save results
+    with open(results_path, 'wb') as f:
+        pickle.dump(results, f)
+    print(f"Results saved to {{results_path}}")
+
+if __name__ == "__main__":
+    prog_path = sys.argv[1]
+    data_path = sys.argv[2]
+    nu_val = float(sys.argv[3])
+    rho_val = float(sys.argv[4])
+    res_path = sys.argv[5] # Adjusted index
+    run_evaluation(prog_path, data_path, nu_val, rho_val, res_path) # Removed t_max_factor
+"""
+        temp_file.write(script)
+        temp_file_path = temp_file.name
+
+    results_path = f"{temp_file_path}.results"
+
+    gpu_id = get_free_gpu()
+    env = os.environ.copy()
+    if gpu_id is not None:
+        env['CUDA_VISIBLE_DEVICES'] = gpu_id
+        print(f"Setting CUDA_VISIBLE_DEVICES={gpu_id} for subprocess.")
+    else:
+        print("Warning: Running subprocess without setting CUDA_VISIBLE_DEVICES.")
+
+    try:
+        cmd = [
+            sys.executable, temp_file_path,
+            program_path, dataset_path, str(nu), str(rho), results_path # Adjusted command
+        ]
+        print(f"Running command: {' '.join(cmd)}")
         process = subprocess.Popen(
-            [sys.executable, temp_file_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
         )
-        
+
         try:
             stdout, stderr = process.communicate(timeout=timeout_seconds)
             exit_code = process.returncode
-            
-            # Print output for debugging
-            if stdout:
-                print(f"Subprocess stdout: {stdout.decode()}")
+
+            print(f"Subprocess stdout:\n{stdout.decode(errors='ignore')}")
             if stderr:
-                print(f"Subprocess stderr: {stderr.decode()}")
-            
+                print(f"Subprocess stderr:\n{stderr.decode(errors='ignore')}")
+
             if exit_code != 0:
-                raise RuntimeError(f"Process exited with code {exit_code}")
-            
-            # Load results
+                 raise RuntimeError(f"Process exited with code {exit_code}. Stderr: {stderr.decode(errors='ignore')}")
+
             if os.path.exists(results_path):
-                with open(results_path, 'rb') as f:
+                with open(results_path, "rb") as f:
                     results = pickle.load(f)
-                
-                if not results.get('success', False):
-                    raise RuntimeError(f"Solver execution failed: {results.get('error', 'Unknown error')}")
-                
+                if results.get('status') == 'error':
+                    raise RuntimeError(f"Program execution failed: {results['error']}\n{results.get('traceback', '')}")
                 return results
             else:
-                raise RuntimeError("Results file not found")
-                
+                raise RuntimeError(f"Results file not found. Stdout: {stdout.decode(errors='ignore')}, Stderr: {stderr.decode(errors='ignore')}")
+
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
             raise TimeoutError(f"Process timed out after {timeout_seconds} seconds")
-            
+
     finally:
-        # Clean up
         if os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
+             os.unlink(temp_file_path)
         if os.path.exists(results_path):
-            os.unlink(results_path)
+             os.unlink(results_path)
 
+# --- Core Evaluation Logic ---
 
-def evaluate(program_path, dataset_path='ReacDiff_Nu0.5_Rho1.0.hdf5',
-             nu=0.5, rho=1.0):
+def _core_evaluate(program_path, dataset_path, nu, rho):
     """
-    Evaluate the PDE solver on the reaction-diffusion equation.
-    
-    Args:
-        program_path: Path to the solver file containing solver() function
-        dataset_path: Path to the HDF5 dataset
-        nu: Diffusion coefficient
-        rho: Reaction coefficient
-        
-    Returns:
-        Dictionary of evaluation metrics
-    """
-    # Target values for good performance (based on typical finite difference methods)
-    TARGET_NRMSE = 1e-3  # Target nRMSE for accurate solution
-    TARGET_CONVERGENCE_RATE = 2.0  # Expected convergence rate for 2nd order methods
-    
-    try:
-        # Run solver with timeout
-        results = run_with_timeout(program_path, dataset_path, nu, rho, timeout_seconds=600)
-        
-        nrmse = results['nrmse']
-        avg_rate = results['avg_rate']
-        solver_time = results['solver_time']
-        
-        # Calculate scores
-        # nRMSE score: exponential decay, perfect score at TARGET_NRMSE
-        nrmse_score = np.exp(-nrmse / TARGET_NRMSE) if nrmse > 0 else 1.0
-        
-        # Convergence rate score: normalized to TARGET_CONVERGENCE_RATE
-        rate_score = min(avg_rate / TARGET_CONVERGENCE_RATE, 1.0) if avg_rate > 0 else 0.0
-        
-        # Time score: prefer faster solvers (bonus for < 10s)
-        time_score = min(10.0 / solver_time, 1.0) if solver_time > 0 else 0.0
-        
-        # Validity: solution is valid if nRMSE is reasonable
-        validity = 1.0 if nrmse < 1.0 else 0.0
-        
-        # Combined score weighted by importance
-        combined_score = (0.5 * nrmse_score + 0.3 * rate_score + 0.2 * time_score) * validity
-        
-        print(f"Evaluation complete:")
-        print(f"  nRMSE: {nrmse:.6f} (target: {TARGET_NRMSE})")
-        print(f"  Convergence rate: {avg_rate:.3f} (target: {TARGET_CONVERGENCE_RATE})")
-        print(f"  Solver time: {solver_time:.2f}s")
-        print(f"  Combined score: {combined_score:.3f}")
-        
-        return {
-            "nrmse": float(nrmse),
-            "convergence_rate": float(avg_rate),
-            "solver_time": float(solver_time),
-            "nrmse_score": float(nrmse_score),
-            "rate_score": float(rate_score),
-            "time_score": float(time_score),
-            "validity": float(validity),
-            "combined_score": float(combined_score)
-        }
-        
-    except Exception as e:
-        print(f"Evaluation failed: {str(e)}")
-        traceback.print_exc()
-        return {
-            "nrmse": float('inf'),
-            "convergence_rate": 0.0,
-            "solver_time": 0.0,
-            "nrmse_score": 0.0,
-            "rate_score": 0.0,
-            "time_score": 0.0,
-            "validity": 0.0,
-            "combined_score": 0.0
-        }
-
-
-def evaluate_stage1(program_path, dataset_path='ReacDiff_Nu0.5_Rho1.0.hdf5',
-                   nu=0.5, rho=1.0):
-    """
-    Stage 1: Quick validation check - test on smaller problem size.
+    Core evaluation logic.
     """
     try:
-        # Create a minimal test case
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as temp_file:
-            script = f"""
-import sys
-import numpy as np
-import pickle
-import traceback
-
-sys.path.insert(0, os.path.dirname('{program_path}'))
-
-try:
-    # Import solver
-    spec = __import__('importlib.util').util.spec_from_file_location("solver_module", '{program_path}')
-    solver_module = __import__('importlib.util').util.module_from_spec(spec)
-    spec.loader.exec_module(solver_module)
-    
-    # Create small test case
-    nx = 64
-    nt = 50
-    x = np.linspace(-1, 1, nx)
-    t = np.linspace(0, 0.1, nt)
-    
-    # Simple initial condition
-    u0 = np.sin((x + 1.0) * np.pi)
-    u0 = u0.reshape(1, -1)  # Add batch dimension
-    
-    # Run solver
-    u_result = solver_module.solver(u0, t, {nu}, {rho})
-    u_result = np.array(u_result)
-    
-    # Basic checks
-    success = True
-    error_msg = ""
-    
-    # Check shape
-    expected_shape = (1, len(t), nx)
-    if u_result.shape != expected_shape:
-        success = False
-        error_msg = f"Wrong shape: {{u_result.shape}} != {{expected_shape}}"
-    
-    # Check for NaN/Inf
-    if np.any(np.isnan(u_result)) or np.any(np.isinf(u_result)):
-        success = False
-        error_msg = "Solution contains NaN or Inf"
-    
-    # Check stability (solution shouldn't explode)
-    max_val = np.max(np.abs(u_result))
-    if max_val > 100:
-        success = False
-        error_msg = f"Solution appears unstable: max value = {{max_val}}"
-    
-    results = {{
-        'success': success,
-        'error_msg': error_msg,
-        'max_val': float(max_val),
-        'shape': u_result.shape
-    }}
-    
-    with open('{temp_file.name}.results', 'wb') as f:
-        pickle.dump(results, f)
-        
-except Exception as e:
-    with open('{temp_file.name}.results', 'wb') as f:
-        pickle.dump({{'success': False, 'error_msg': str(e)}}, f)
-"""
-            temp_file.write(script.encode())
-            temp_file_path = temp_file.name
-        
-        results_path = f"{temp_file_path}.results"
-        
-        # Run with short timeout
-        process = subprocess.Popen(
-            [sys.executable, temp_file_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        
-        try:
-            stdout, stderr = process.communicate(timeout=60)  # 1 minute timeout for stage 1
-            
-            if os.path.exists(results_path):
-                with open(results_path, 'rb') as f:
-                    results = pickle.load(f)
-                
-                validity = 1.0 if results['success'] else 0.0
-                combined_score = validity  # Simple score for stage 1
-                
-                return {
-                    "validity": float(validity),
-                    "combined_score": float(combined_score),
-                    "error": results.get('error_msg', ''),
-                    "stage": 1
-                }
-            else:
-                raise RuntimeError("Stage 1 results not found")
-                
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            return {
+        if not os.path.exists(dataset_path):
+             print(f"Error: Dataset path {dataset_path} does not exist. Cannot evaluate.")
+             return {
+                "rmse": float('inf'),
+                "negative_rmse": float('-inf'),
+                "eval_time": 0.0,
                 "validity": 0.0,
                 "combined_score": 0.0,
-                "error": "Stage 1 timeout",
-                "stage": 1
-            }
-        finally:
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-            if os.path.exists(results_path):
-                os.unlink(results_path)
-                
-    except Exception as e:
-        print(f"Stage 1 evaluation failed: {e}")
-        traceback.print_exc()
+                "error": f"Dataset not found at {dataset_path}"
+             }
+
+        results = run_with_timeout(
+            program_path, dataset_path, nu, rho, timeout_seconds=2400
+        )
+
+        rmse = results.get('rmse', float('inf'))
+        eval_time = results.get('eval_time', 0.0)
+
+        validity = 1.0 if rmse != float('inf') and not np.isnan(rmse) else 0.0
+
+        if validity == 0.0:
+            negative_rmse = float('-inf')
+            combined_score = 0.0
+        elif rmse == 0.0:
+            negative_rmse = float('inf')
+            combined_score = 1.0 # Max score for perfect RMSE
+        else:
+            negative_rmse = -rmse
+            # Define range for -log10(rmse) to map to [0, 1]
+            S_min = 0.0 # Corresponds to RMSE = 1.0
+            S_max = 8.0 # Corresponds to RMSE = 1e-8 (This is the target for max score)
+            # Clip and normalize
+            combined_score = np.clip(-np.log10(rmse), S_min, S_max) / S_max
+            # Ensure it's within [0, 1]
+            combined_score = np.clip(combined_score, 0.0, 1.0)
+
+        print(
+            f"Evaluation: RMSE={rmse:.3e}, negative_rmse={negative_rmse:.3f}, "
+            f"Time={eval_time:.2f}s, Score={combined_score:.4f}"
+        )
+
         return {
-            "validity": 0.0,
-            "combined_score": 0.0,
-            "error": str(e),
-            "stage": 1
+            "rmse": float(rmse),
+            "negative_rmse": float(negative_rmse),
+            "eval_time": float(eval_time),
+            "validity": float(validity),
+            "combined_score": float(combined_score),
         }
 
+    except Exception as e:
+        print(f"Evaluation failed completely: {str(e)}")
+        traceback.print_exc()
+        return {
+            "rmse": float('inf'),
+            "negative_rmse": float('-inf'),
+            "eval_time": 0.0,
+            "validity": 0.0,
+            "combined_score": 0.0,
+            "error": str(e)
+        }
 
-def evaluate_stage2(program_path, dataset_path='ReacDiff_Nu0.5_Rho1.0.hdf5',
-                   nu=0.5, rho=1.0):
+# --- Evaluation Functions (Simplified Interface) ---
+
+def evaluate(program_path):
     """
-    Stage 2: Full evaluation on the complete dataset.
+    Evaluate the PDE solver program with default/full parameters.
+    Dataset info is hardcoded.
     """
-    # Run full evaluation
-    results = evaluate(program_path, dataset_path, nu, rho)
-    results['stage'] = 2
-    return results
+    print("--- Running Full Evaluation ---")
+    dataset_path = 'ReacDiff_Nu0.5_Rho1.0_development.hdf5'
+    nu = 0.5
+    rho = 1.0
+    return _core_evaluate(program_path, dataset_path, nu, rho)
+
+def evaluate_stage1(program_path):
+    """
+    First stage evaluation - quick check.
+    Dataset info is hardcoded.
+    """
+    print("--- Running Stage 1 Evaluation ---")
+    dataset_path = 'ReacDiff_Nu0.5_Rho1.0_development.hdf5'
+    nu = 0.5
+    rho = 1.0
+    # Currently same as full eval, as t_max_conv_factor is removed
+    return _core_evaluate(program_path, dataset_path, nu, rho)
 
 
-# Example usage:
-if __name__ == "__main__":
-    # For testing, create a dummy solver
-    test_solver_code = '''
-import numpy as np
+def evaluate_stage2(program_path):
+    """
+    Second stage evaluation - same as full 'evaluate'.
+    Dataset info is hardcoded.
+    """
+    print("--- Running Stage 2 Evaluation ---")
+    return evaluate(program_path)
 
-def solver(u0, t_coordinate, nu, rho):
-    """
-    Dummy solver for testing - replace with actual PDE solver.
-    This should solve: ∂u/∂t = nu * ∂²u/∂x² + rho * u * (1 - u)
-    """
-    # Get dimensions
-    batch_size, nx = u0.shape
-    nt = len(t_coordinate)
+if __name__ == '__main__':
+    import argparse
     
-    # Initialize solution array
-    u = np.zeros((batch_size, nt, nx))
-    u[:, 0, :] = u0
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Evaluate 1D Reaction-Diffusion PDE Solver')
+    parser.add_argument('program_path', type=str, help='Path to the solver program')
+    parser.add_argument('--dataset', type=str, default='ReacDiff_Nu0.5_Rho1.0_development.hdf5',
+                        help='Path to the dataset (default: ReacDiff_Nu0.5_Rho1.0_development.hdf5)')
+    parser.add_argument('--nu', type=float, default=0.5,
+                        help='Nu parameter value (default: 0.5)')
+    parser.add_argument('--rho', type=float, default=1.0,
+                        help='Rho parameter value (default: 1.0)')
+    parser.add_argument('--stage', type=int, choices=[1, 2], default=None,
+                        help='Run specific stage evaluation (1 or 2). If not specified, runs full evaluation.')
     
-    # Simple forward Euler for demonstration
-    dt = t_coordinate[1] - t_coordinate[0] if nt > 1 else 0.01
-    dx = 2.0 / nx  # Domain is [-1, 1]
+    args = parser.parse_args()
     
-    for n in range(1, nt):
-        for i in range(1, nx-1):
-            # Diffusion term (centered difference)
-            diff = nu * (u[:, n-1, i+1] - 2*u[:, n-1, i] + u[:, n-1, i-1]) / (dx**2)
-            # Reaction term
-            react = rho * u[:, n-1, i] * (1 - u[:, n-1, i])
-            # Update
-            u[:, n, i] = u[:, n-1, i] + dt * (diff + react)
-        
-        # Boundary conditions (Neumann)
-        u[:, n, 0] = u[:, n, 1]
-        u[:, n, -1] = u[:, n, -2]
+    print(f"Evaluating solver: {args.program_path}")
+    print(f"Using dataset: {args.dataset}")
+    print(f"Parameters: nu={args.nu}, rho={args.rho}")
+    print("-" * 60)
     
-    return u
-'''
+    # Run evaluation based on stage or full evaluation
+    if args.stage == 1:
+        # For stage 1, we can override the default dataset path
+        original_dataset = 'ReacDiff_Nu0.5_Rho1.0_development.hdf5'
+        # Temporarily modify the function to use custom dataset
+        results = _core_evaluate(args.program_path, args.dataset, args.nu, args.rho)
+        print("\n=== Stage 1 Evaluation Results ===")
+    elif args.stage == 2:
+        # For stage 2, directly use custom parameters
+        results = _core_evaluate(args.program_path, args.dataset, args.nu, args.rho)
+        print("\n=== Stage 2 Evaluation Results ===")
+    else:
+        # Full evaluation with custom parameters
+        results = _core_evaluate(args.program_path, args.dataset, args.nu, args.rho)
+        print("\n=== Full Evaluation Results ===")
     
-    # Save test solver to file
-    with open('test_solver.py', 'w') as f:
-        f.write(test_solver_code)
+    # Print results in a formatted way
+    print(f"RMSE: {results['rmse']:.6e}")
+    print(f"Negative RMSE: {results['negative_rmse']:.6f}")
+    print(f"Evaluation Time: {results['eval_time']:.2f} seconds")
+    print(f"Validity: {results['validity']}")
+    print(f"Combined Score: {results['combined_score']:.4f}")
     
-    # Test the evaluator
-    print("Testing Stage 1...")
-    stage1_results = evaluate_stage1('test_solver.py')
-    print(f"Stage 1 results: {stage1_results}")
+    if 'error' in results:
+        print(f"\nError encountered: {results['error']}")
     
-    if stage1_results['validity'] > 0:
-        print("\nTesting Stage 2...")
-        stage2_results = evaluate_stage2('test_solver.py')
-        print(f"Stage 2 results: {stage2_results}")
+    print("-" * 60)
     
-    # Clean up
-    os.unlink('test_solver.py')
+    
+    # Exit with appropriate code
+    sys.exit(0 if results['validity'] == 1.0 else 1)

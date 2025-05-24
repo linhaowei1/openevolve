@@ -51,9 +51,7 @@ class OpenAILLM(LLMInterface):
         formatted_messages.extend(messages)
 
         # Set up generation parameters
-        if self.config.api_base == "https://api.openai.com/v1" and str(
-            self.model
-        ).lower().startswith("o"):
+        if str(self.model).lower().startswith("o"):
             # For o-series models
             params = {
                 "model": self.model,
