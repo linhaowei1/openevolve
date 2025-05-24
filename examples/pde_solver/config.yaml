@@ -1,0 +1,77 @@
+max_iterations: 100  # Increased iterations
+checkpoint_interval: 10
+log_level: "INFO"
+
+# LLM configuration
+llm:
+  primary_model: "gpt-4.1-mini"
+  # primary_model: "llama3.1-8b"
+  primary_model_weight: 0.8
+  secondary_model: "o4-mini"
+  # secondary_model: "llama-4-scout-17b-16e-instruct"
+  secondary_model_weight: 0.2
+  api_base: "https://api.dwyu.top/v1"
+  # api_base: "https://api.cerebras.ai/v1"
+  temperature: 0.7
+  top_p: 0.95
+  max_tokens: 8192
+  timeout: 600 
+
+# Prompt configuration
+prompt:
+  system_message: |
+    You are an intelligent AI researcher for coding, numerical algorithms, and scientific computing.
+    Your goal is to conduct cutting-edge research in the field of PDE solving by leveraging and creatively improving existing algorithms to maximize performances based on feedbacks.
+    Follow the user's requirements carefully and make sure you understand them.
+    Always document your code as comments to explain the reason behind them.
+    Your task is to solve a partial differential equation (PDE) using Python in batch mode.
+
+    The PDE is a diffusion-reaction equation, given by
+
+    \\[
+    \\begin{{cases}}
+    \\partial_t u(t, x) - \\nu \\partial_{{xx}} u(t, x) - \\rho u(1 - u) = 0, & x \\in (0,1), \; t \in (0,T] \\\\
+    u(0, x) = u_0(x), & x \in (0,1)
+    \end{{cases}}
+    \\]
+
+    where $\\nu$ and $\\rho$ are coefficients representing diffusion and reaction terms, respectively. In our task, we assume the periodic boundary condition.
+
+    Given the discretization of $u_0(x)$ of shape [batch_size, N] where $N$ is the number of spatial points, you need to implement a solver to predict $u(\cdot, t)$ for the specified subsequent time steps ($t = t_1, \ldots, t_T$). The solution is of shape [batch_size, T+1, N] (with the initial time frame and the subsequent steps). Note that although the required time steps are specified, you should consider using smaller time steps internally to obtain more stable simulation.
+
+    In particular, your code should be tailored to the case where $\\nu={reacdiff1d_nu}, \\rho={reacdiff1d_rho}$, i.e., optimizing it particularly for this use case.
+    Think carefully about the structure of the reaction and diffusion terms in the PDE and how you can exploit this structure to derive accurate result.
+
+    The goal is to get a very low nRMSE (normalized RMSE) and make the code as fast as possible.
+
+    If the RMSE is much higher than 1e-2 or becomes Nan, it is likely that there is a bug in the implementation and you must debug it or think about completely different approaches. 
+    If the running time is much longer than 600s, you must prioritize making it more efficient.
+    The convergence rate is the empirical order of convergence with respect to spatial resolution. It is also a good indicator of the performance of the algorithm which you may consider.
+
+    You can implement auxiliary functions or add additional arguments to the function if needed.
+    You can use PyTorch or JAX with GPU acceleration.
+    You can consider known techniques and analyze their effiectiveness based on exisiting results. You should also consider combining existing techniques or even developing new techniques since you are doing cutting-edge research.
+
+    Your generated code will be executed to evaluated. Make sure your `solver` function runs correctly and efficiently.
+  num_top_programs: 3
+  use_template_stochasticity: true
+
+# Database configuration
+database:
+  population_size: 60  # Increased population for more diversity
+  archive_size: 25
+  num_islands: 4
+  elite_selection_ratio: 0.3
+  exploitation_ratio: 0.7
+
+# Evaluator configuration
+evaluator:
+  timeout: 600
+  cascade_evaluation: true
+  cascade_thresholds: [0.5, 0.75]
+  parallel_evaluations: 4
+  use_llm_feedback: false
+
+# Evolution settings
+diff_based_evolution: false  # Use full rewrites instead of diffs
+allow_full_rewrites: true    # Allow full rewrites for constructor functions
