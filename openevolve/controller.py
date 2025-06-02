@@ -1,7 +1,7 @@
 """
 Main controller for OpenEvolve
 """
-
+import math
 import asyncio
 import logging
 import os
@@ -40,6 +40,7 @@ class OpenEvolve:
     - Ensures the best solution is not lost during the MAP-Elites process
     - Always includes the best program in the selection process for inspiration
     - Maintains detailed logs and metadata about improvements
+    - Supports parallel evaluation of multiple programs
     """
 
     def __init__(
@@ -179,109 +180,42 @@ class OpenEvolve:
             f"Starting evolution from iteration {start_iteration} for {max_iterations} iterations (total: {total_iterations})"
         )
 
+        # Determine if we should use parallel evaluation
+        use_parallel = (
+            self.config.evaluator.distributed 
+            and self.config.evaluator.parallel_evaluations > 1
+        )
+        
+        if use_parallel:
+            logger.info(f"Using parallel evaluation with {self.config.evaluator.parallel_evaluations} concurrent evaluations")
+        else:
+            logger.info("Using sequential evaluation")
+
         for i in range(start_iteration, total_iterations):
             iteration_start = time.time()
 
-            # Sample parent and inspirations
-            parent, inspirations = self.database.sample()
+            if use_parallel:
+                # Parallel evaluation path
+                await self._run_parallel_iteration(i, target_score)
+            else:
+                # Original sequential evaluation path
+                await self._run_sequential_iteration(i, target_score)
 
-            # Build prompt
-            prompt = self.prompt_sampler.build_prompt(
-                current_program=parent.code,
-                parent_program=parent.code,  # We don't have the parent's code, use the same
-                program_metrics=parent.metrics,
-                previous_programs=[p.to_dict() for p in self.database.get_top_programs(3)],
-                top_programs=[p.to_dict() for p in inspirations],
-                language=self.language,
-                evolution_round=i,
-                allow_full_rewrite=self.config.allow_full_rewrites,
-            )
-
-            # Generate code modification
-            try:
-                llm_response = await self.llm_ensemble.generate_with_context(
-                    system_message=prompt["system"],
-                    messages=[{"role": "user", "content": prompt["user"]}],
-                )
-
-                # Parse the response
-                if self.config.diff_based_evolution:
-                    diff_blocks = extract_diffs(llm_response)
-
-                    if not diff_blocks:
-                        logger.warning(f"Iteration {i+1}: No valid diffs found in response")
-                        continue
-
-                    # Apply the diffs
-                    child_code = apply_diff(parent.code, llm_response)
-                    changes_summary = format_diff_summary(diff_blocks)
-                else:
-                    # Parse full rewrite
-                    new_code = parse_full_rewrite(llm_response, self.language)
-
-                    if not new_code:
-                        logger.warning(f"Iteration {i+1}: No valid code found in response")
-                        continue
-
-                    child_code = new_code
-                    changes_summary = "Full rewrite"
-
-                # Check code length
-                if len(child_code) > self.config.max_code_length:
-                    logger.warning(
-                        f"Iteration {i+1}: Generated code exceeds maximum length "
-                        f"({len(child_code)} > {self.config.max_code_length})"
-                    )
-                    continue
-
-                # Evaluate the child program
-                child_id = str(uuid.uuid4())
-                child_metrics = await self.evaluator.evaluate_program(child_code, child_id)
-
-                # Create a child program
-                child_program = Program(
-                    id=child_id,
-                    code=child_code,
-                    language=self.language,
-                    parent_id=parent.id,
-                    generation=parent.generation + 1,
-                    metrics=child_metrics,
-                    metadata={
-                        "changes": changes_summary,
-                        "parent_metrics": parent.metrics,
-                    },
-                )
-
-                # Add to database
-                self.database.add(child_program, iteration=i + 1)
-
-                # Log progress
-                iteration_time = time.time() - iteration_start
-                self._log_iteration(i, parent, child_program, iteration_time)
-
-                # Specifically check if this is the new best program
-                if self.database.best_program_id == child_program.id:
-                    logger.info(
-                        f"🌟 New best solution found at iteration {i+1}: {child_program.id}"
-                    )
-                    logger.info(
-                        f"Metrics: {', '.join(f'{name}={value:.4f}' for name, value in child_program.metrics.items())}"
-                    )
-
-                # Save checkpoint
-                if (i + 1) % self.config.checkpoint_interval == 0:
-                    self._save_checkpoint(i + 1)
-
-                # Check if target score reached
-                if target_score is not None:
-                    avg_score = sum(child_metrics.values()) / max(1, len(child_metrics))
+            # Check if target score reached (if we haven't broken out already)
+            if target_score is not None:
+                best_program = self.database.get_best_program()
+                if best_program and best_program.metrics:
+                    avg_score = sum(best_program.metrics.values()) / max(1, len(best_program.metrics))
                     if avg_score >= target_score:
                         logger.info(f"Target score {target_score} reached after {i+1} iterations")
                         break
 
-            except Exception as e:
-                logger.error(f"Error in iteration {i+1}: {str(e)}")
-                continue
+            # Save checkpoint
+            if (i + 1) % self.config.checkpoint_interval == 0:
+                self._save_checkpoint(i + 1)
+
+            iteration_time = time.time() - iteration_start
+            logger.info(f"Iteration {i+1} completed in {iteration_time:.2f}s")
 
         # Get the best program using our tracking mechanism
         best_program = None
@@ -295,7 +229,7 @@ class OpenEvolve:
             logger.info("Using calculated best program (tracked program not found)")
 
         # Check if there's a better program by combined_score that wasn't tracked
-        if "combined_score" in best_program.metrics:
+        if best_program and "combined_score" in best_program.metrics:
             best_by_combined = self.database.get_best_program(metric="combined_score")
             if (
                 best_by_combined
@@ -330,6 +264,287 @@ class OpenEvolve:
             # Return None if no programs found instead of undefined initial_program
             return None
 
+    def _validate_metrics(self, metrics: Dict[str, float]) -> bool:
+        """
+        Validate metrics to ensure they don't contain invalid values
+        
+        Args:
+            metrics: Dictionary of metric names to values
+            
+        Returns:
+            True if metrics are valid, False otherwise
+        """
+        if not metrics:
+                return False
+        
+        print("check_metrics:", metrics)    
+        
+        # Check for NaN, infinity, or None values
+        for name, value in metrics.items():
+            if value is None:
+                return False
+            if isinstance(value, float):
+                if math.isnan(value) or math.isinf(value):
+                    return False
+    
+        
+        return True
+
+    async def _run_sequential_iteration(self, iteration: int, target_score: Optional[float]) -> None:
+        """Run a single iteration with sequential evaluation (original logic)"""
+        # Sample parent and inspirations
+        parent, inspirations = self.database.sample()
+
+        # Build prompt
+        prompt = self.prompt_sampler.build_prompt(
+            current_program=parent.code,
+            parent_program=parent.code,  # We don't have the parent's code, use the same
+            program_metrics=parent.metrics,
+            previous_programs=[p.to_dict() for p in self.database.get_top_programs(3)],
+            top_programs=[p.to_dict() for p in inspirations],
+            language=self.language,
+            evolution_round=iteration,
+            allow_full_rewrite=self.config.allow_full_rewrites,
+        )
+        # Generate code modification
+        try:
+            llm_response = await self.llm_ensemble.generate_with_context(
+                system_message=prompt["system"],
+                messages=[{"role": "user", "content": prompt["user"]}],
+            )
+
+            # Parse the response
+            if self.config.diff_based_evolution:
+                diff_blocks = extract_diffs(llm_response)
+
+                if not diff_blocks:
+                    logger.warning(f"Iteration {iteration+1}: No valid diffs found in response")
+                    return
+
+                # Apply the diffs
+                child_code = apply_diff(parent.code, llm_response)
+                changes_summary = format_diff_summary(diff_blocks)
+            else:
+                # Parse full rewrite
+                new_code = parse_full_rewrite(llm_response, self.language)
+
+                if not new_code:
+                    logger.warning(f"Iteration {iteration+1}: No valid code found in response")
+                    return
+
+                child_code = new_code
+                changes_summary = "Full rewrite"
+
+            # Check code length
+            if len(child_code) > self.config.max_code_length:
+                logger.warning(
+                    f"Iteration {iteration+1}: Generated code exceeds maximum length "
+                    f"({len(child_code)} > {self.config.max_code_length})"
+                )
+                return
+
+            # Evaluate the child program
+            child_id = str(uuid.uuid4())
+            child_metrics = await self.evaluator.evaluate_program(child_code, child_id)
+
+            # Create a child program
+            child_program = Program(
+                id=child_id,
+                code=child_code,
+                language=self.language,
+                parent_id=parent.id,
+                generation=parent.generation + 1,
+                metrics=child_metrics,
+                metadata={
+                    "changes": changes_summary,
+                    "parent_metrics": parent.metrics,
+                },
+            )
+
+            # Add to database
+            self.database.add(child_program, iteration=iteration + 1)
+
+            # Log progress
+            self._log_iteration(iteration, parent, child_program, 0)
+
+            # Specifically check if this is the new best program
+            if self.database.best_program_id == child_program.id:
+                logger.info(
+                    f"🌟 New best solution found at iteration {iteration+1}: {child_program.id}"
+                )
+                logger.info(
+                    f"Metrics: {', '.join(f'{name}={value:.4f}' for name, value in child_program.metrics.items())}"
+                )
+
+        except Exception as e:
+            logger.error(f"Error in iteration {iteration+1}: {str(e)}")
+
+    async def _run_parallel_iteration(self, iteration: int, target_score: Optional[float]) -> None:
+        """Run a single iteration with parallel evaluation"""
+        num_parallel = self.config.evaluator.parallel_evaluations
+        
+        # Sample multiple parents and inspirations
+        parents_and_inspirations = []
+        for _ in range(num_parallel):
+            parent, inspirations = self.database.sample()
+            parents_and_inspirations.append((parent, inspirations))
+        
+        logger.info(f"Iteration {iteration+1}: Sampled {len(parents_and_inspirations)} parents for parallel evolution")
+        
+        # Generate prompts for all parents
+        generation_tasks = []
+        for parent, inspirations in parents_and_inspirations:
+            prompt = self.prompt_sampler.build_prompt(
+                current_program=parent.code,
+                parent_program=parent.code,
+                program_metrics=parent.metrics,
+                previous_programs=[p.to_dict() for p in self.database.get_top_programs(3)],
+                top_programs=[p.to_dict() for p in inspirations],
+                language=self.language,
+                evolution_round=iteration,
+                allow_full_rewrite=self.config.allow_full_rewrites,
+            )
+            
+            # Create async task for LLM generation
+            task = self._generate_child_code(prompt, parent, iteration)
+            generation_tasks.append(task)
+        
+        # Run all LLM generations in parallel
+        generation_results = await asyncio.gather(*generation_tasks, return_exceptions=True)
+        
+        # Filter successful generations
+        valid_generations = []
+        for i, result in enumerate(generation_results):
+            if isinstance(result, Exception):
+                logger.error(f"Error generating child {i+1}: {str(result)}")
+            elif result is not None:
+                parent, child_code, changes_summary = result
+                valid_generations.append((parent, child_code, changes_summary))
+        
+        if not valid_generations:
+            logger.warning(f"Iteration {iteration+1}: No valid code generations")
+            return
+        
+        logger.info(f"Iteration {iteration+1}: {len(valid_generations)} valid code generations")
+        
+        # Prepare programs for parallel evaluation
+        programs_to_evaluate = []
+        generation_metadata = []
+        
+        for parent, child_code, changes_summary in valid_generations:
+            child_id = str(uuid.uuid4())
+            programs_to_evaluate.append((child_code, child_id))
+            generation_metadata.append({
+                "id": child_id,
+                "parent": parent,
+                "changes_summary": changes_summary
+            })
+        
+        # Evaluate all programs in parallel
+        logger.info(f"Iteration {iteration+1}: Evaluating {len(programs_to_evaluate)} programs in parallel")
+        all_metrics = await self.evaluator.evaluate_multiple(programs_to_evaluate)
+        
+        # Process results and add to database
+        new_best_found = False
+        successful_additions = 0
+        
+        for i, metrics in enumerate(all_metrics):
+            metadata = generation_metadata[i]
+            parent = metadata["parent"]
+            
+            # Validate metrics - skip if invalid
+            if not self._validate_metrics(metrics):
+                logger.warning(f"Iteration {iteration+1}: Skipping program {metadata['id']} due to invalid metrics")
+                continue
+            
+            # Create child program
+            child_program = Program(
+                id=metadata["id"],
+                code=valid_generations[i][1],  # child_code
+                language=self.language,
+                parent_id=parent.id,
+                generation=parent.generation + 1,
+                metrics=metrics,
+                metadata={
+                    "changes": metadata["changes_summary"],
+                    "parent_metrics": parent.metrics,
+                },
+            )
+            
+            try:
+                # Add to database
+                self.database.add(child_program, iteration=iteration + 1)
+                successful_additions += 1
+                
+                # Log progress
+                self._log_iteration(iteration, parent, child_program, 0)
+                
+                # Check if this is the new best program
+                if self.database.best_program_id == child_program.id:
+                    new_best_found = True
+                    logger.info(
+                        f"🌟 New best solution found at iteration {iteration+1}: {child_program.id}"
+                    )
+                    logger.info(
+                        f"Metrics: {', '.join(f'{name}={value:.4f}' for name, value in child_program.metrics.items())}"
+                    )
+            except Exception as e:
+                logger.error(f"Error adding program {metadata['id']} to database: {str(e)}")
+        
+        
+        logger.info(f"Iteration {iteration+1}: Successfully added {successful_additions}/{len(all_metrics)} programs to database" + 
+                   (f", found new best!" if new_best_found else ""))
+
+    async def _generate_child_code(
+        self, 
+        prompt: Dict[str, str], 
+        parent: Program, 
+        iteration: int
+    ) -> Optional[Tuple[Program, str, str]]:
+        """Generate child code from a parent program"""
+        
+        try:
+            llm_response = await self.llm_ensemble.generate_with_context(
+                system_message=prompt["system"],
+                messages=[{"role": "user", "content": prompt["user"]}],
+            )
+
+            # Parse the response
+            if self.config.diff_based_evolution:
+                diff_blocks = extract_diffs(llm_response)
+
+                if not diff_blocks:
+                    logger.warning(f"No valid diffs found in response for parent {parent.id}")
+                    return None
+
+                # Apply the diffs
+                child_code = apply_diff(parent.code, llm_response)
+                changes_summary = format_diff_summary(diff_blocks)
+            else:
+                # Parse full rewrite
+                new_code = parse_full_rewrite(llm_response, self.language)
+
+                if not new_code:
+                    logger.warning(f"No valid code found in response for parent {parent.id}")
+                    return None
+
+                child_code = new_code
+                changes_summary = "Full rewrite"
+
+            # Check code length
+            if len(child_code) > self.config.max_code_length:
+                logger.warning(
+                    f"Generated code exceeds maximum length for parent {parent.id} "
+                    f"({len(child_code)} > {self.config.max_code_length})"
+                )
+                return None
+
+            return (parent, child_code, changes_summary)
+
+        except Exception as e:
+            logger.error(f"Error generating child from parent {parent.id}: {str(e)}")
+            return None
+
     def _log_iteration(
         self,
         iteration: int,
@@ -355,12 +570,16 @@ class OpenEvolve:
 
         improvement_str = ", ".join(f"{name}={diff:+.4f}" for name, diff in improvement.items())
 
-        logger.info(
+        log_msg = (
             f"Iteration {iteration+1}: Child {child.id} from parent {parent.id} "
-            f"in {elapsed_time:.2f}s. Metrics: "
-            f"{', '.join(f'{name}={value:.4f}' for name, value in child.metrics.items())} "
+            f"Metrics: {', '.join(f'{name}={value:.4f}' for name, value in child.metrics.items())} "
             f"(Δ: {improvement_str})"
         )
+        
+        if elapsed_time > 0:
+            log_msg += f" in {elapsed_time:.2f}s"
+            
+        logger.info(log_msg)
 
     def _save_checkpoint(self, iteration: int) -> None:
         """

@@ -73,6 +73,7 @@ class OpenAILLM(LLMInterface):
         timeout = kwargs.get("timeout", self.config.timeout)
 
         for attempt in range(retries + 1):
+
             try:
                 response = await asyncio.wait_for(self._call_api(params), timeout=timeout)
                 return response
@@ -100,6 +101,5 @@ class OpenAILLM(LLMInterface):
         response = await loop.run_in_executor(
             None, lambda: self.client.chat.completions.create(**params)
         )
-
         # Extract the response content
         return response.choices[0].message.content

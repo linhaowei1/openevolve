@@ -2,7 +2,8 @@
 Evaluator for 1D Reaction-Diffusion PDE Solver with timeout handling
 and automatic GPU allocation. (Modified as per request)
 """
-
+import random
+import argparse
 import importlib.util
 import numpy as np
 import time
@@ -52,8 +53,11 @@ def get_free_gpu():
         if not gpus:
             print("Warning: No GPUs found by nvidia-smi.")
             return None
-
+        
         best_gpu = min(gpus, key=lambda gpu: (gpu['util'], -gpu['free_mem']))
+        best_gpus = [gpu for gpu in gpus if gpu['util'] == best_gpu['util']]
+        best_gpu = random.choice(best_gpus)
+        
         print(f"Found GPUs: {gpus}")
         print(f"Selected GPU {best_gpu['id']} (Util: {best_gpu['util']}%, Free: {best_gpu['free_mem']}MiB)")
         return str(best_gpu['id'])
@@ -354,7 +358,6 @@ def evaluate_stage2(program_path):
     return evaluate(program_path)
 
 if __name__ == '__main__':
-    import argparse
     
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Evaluate 1D Reaction-Diffusion PDE Solver')
@@ -402,7 +405,6 @@ if __name__ == '__main__':
         print(f"\nError encountered: {results['error']}")
     
     print("-" * 60)
-    
     
     # Exit with appropriate code
     sys.exit(0 if results['validity'] == 1.0 else 1)

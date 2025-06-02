@@ -1,17 +1,17 @@
-max_iterations: 200  # Increased iterations
+max_iterations: 500  # Increased iterations
 checkpoint_interval: 1
 log_level: "INFO"
-
+# AIzaSyAz33rcZieEZp7HZtda88XsYWkUFOqVQZc
 # LLM configuration
 llm:
-  primary_model: "claude-3-5-haiku-20241022"
+  primary_model: "gemini-2.5-pro-preview-05-06"
   primary_model_weight: 0.8
-  secondary_model: "claude-sonnet-4-20250514"
+  secondary_model: "gemini-2.5-pro-preview-05-06"
   secondary_model_weight: 0.2
-  api_base: "https://api.dwyu.top/v1"
+  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
   temperature: 0.7
   top_p: 0.95
-  max_tokens: 8192
+  max_tokens: 32768
   timeout: 600 
 
 # Prompt configuration
@@ -41,7 +41,7 @@ prompt:
     The goal is to get a very low nRMSE (normalized RMSE) and make the code as fast as possible (please thoroughly parallelize your computation).
 
     You can implement auxiliary functions or add additional arguments to the function if needed.
-    You can use PyTorch or JAX with GPU acceleration.
+    You can use PyTorch or JAX with GPU acceleration. The version of torch is 2.4.0+cu121, and the version of jax is 0.6.1.
     You can consider known techniques and analyze their effiectiveness based on exisiting results. You should also consider combining existing techniques or even developing new techniques since you are doing cutting-edge research.
 
     Your generated code will be executed to evaluated. Make sure your `solver` function runs correctly and efficiently.
@@ -78,7 +78,7 @@ evaluator:
   timeout: 2400
   cascade_evaluation: false
   cascade_thresholds: [1.0]
-  parallel_evaluations: 3
+  parallel_evaluations: 8
   use_llm_feedback: false
   distributed: true
 
