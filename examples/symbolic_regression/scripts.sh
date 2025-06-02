@@ -68,8 +68,8 @@ for split_name in "${!split_counts[@]}"; do
 
         echo "  Launching $split_name - Problem $i ($initial_program_path)"
         # Run the experiment in the background
-        cmd="python ../../openevolve-run.py "$initial_program_path" "$evaluator_path" --config "$config_path" --iterations 200"
-        eval $cmd &
+        cmd="python ../../openevolve-run.py "$initial_program_path" "$evaluator_path" --config "$config_path" --iterations 100"
+        eval $cmd 
     done
     wait    # let's do split by split
 done
